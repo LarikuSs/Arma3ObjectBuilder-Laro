@@ -1,5 +1,6 @@
 import traceback
 import os
+import re
 import struct
 
 import bpy
@@ -10,6 +11,400 @@ from ..utilities import generic as utils
 from ..utilities import lod as lodutils
 from ..utilities import compat as computils
 from ..io import import_p3d
+
+
+# ---------------------------------------------------------------------------
+# NH Proxy Tool integration
+# ---------------------------------------------------------------------------
+# The functions below are intentionally kept equivalent to the original
+# NH Proxy Tool implementation. They are integrated into A3OB's existing
+# Proxies panel without changing the proxy creation algorithm.
+
+KEY = "cray_source_p3d"
+
+
+def _nh_norm(p):
+    if not p:
+        return ""
+    try:
+        p = bpy.path.abspath(str(p))
+    except Exception:
+        p = str(p)
+    return os.path.normpath(p)
+
+
+def _nh_stripnum(s):
+    s = (s or "").strip()
+    while re.search(r"\.\d{3}$", s):
+        s = re.sub(r"\.\d{3}$", "", s)
+    return s
+
+
+def _nh_basename_key(s):
+    s = _nh_stripnum(os.path.basename(str(s).replace("\\", "/")))
+    if s.lower().endswith(".p3d"):
+        s = s[:-4]
+    return s.lower()
+
+
+def _nh_findp3d(root, key):
+    root = _nh_norm(root)
+    if not root or not os.path.isdir(root) or not key:
+        return []
+
+    out = []
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [x for x in dn if x not in {".git", "__pycache__"}]
+        for f in fn:
+            if f.lower().endswith(".p3d") and _nh_basename_key(f) == key:
+                out.append(os.path.join(dp, f))
+
+    out.sort(key=lambda x: (len(x), x.lower()))
+    return out
+
+
+def _nh_name_candidates(o):
+    seen = set()
+
+    def add(v):
+        k = _nh_basename_key(v)
+        if k and k not in seen:
+            seen.add(k)
+            return k
+
+    for item in (o, getattr(o, "instance_collection", None)):
+        if item:
+            k = add(getattr(item, "name", ""))
+            if k:
+                yield k
+
+    p = getattr(o, "parent", None)
+    while p:
+        k = add(getattr(p, "name", ""))
+        if k:
+            yield k
+
+        inst = getattr(p, "instance_collection", None)
+        if inst:
+            k = add(getattr(inst, "name", ""))
+            if k:
+                yield k
+
+        p = getattr(p, "parent", None)
+
+    for c in getattr(o, "users_collection", []) or []:
+        k = add(getattr(c, "name", ""))
+        if k:
+            yield k
+
+
+def _nh_tagged_paths(o):
+    out = []
+
+    def add(item):
+        if item is None:
+            return
+        try:
+            p = item.get(KEY, "")
+            if p:
+                out.append(_nh_norm(p))
+        except Exception:
+            pass
+
+    add(o)
+
+    try:
+        add(o.instance_collection)
+    except Exception:
+        pass
+
+    p = getattr(o, "parent", None)
+    while p:
+        add(p)
+        try:
+            add(p.instance_collection)
+        except Exception:
+            pass
+        p = getattr(p, "parent", None)
+
+    for c in getattr(o, "users_collection", []) or []:
+        add(c)
+
+    return out
+
+
+def _nh_resolve_nh(o, root):
+    # Kept from the original NH Proxy Tool:
+    # resolve the selected asset's own name first.
+    for k in _nh_name_candidates(o):
+        ms = _nh_findp3d(root, k)
+        if len(ms) == 1:
+            return ms[0]
+        if len(ms) > 1:
+            return None, f"{k}.p3d has {len(ms)} matches"
+
+    # Fallback to the explicit NH source tag.
+    candidates = set(_nh_name_candidates(o))
+    for p in _nh_tagged_paths(o):
+        if not candidates or _nh_basename_key(p) in candidates:
+            return p
+
+    return None, "NH source P3D could not be resolved"
+
+
+def _nh_islod(o):
+    try:
+        return bool(o.a3ob_properties_object.is_a3_lod)
+    except Exception:
+        return False
+
+
+def _nh_isproxy(o):
+    try:
+        return bool(o.a3ob_properties_object_proxy.is_a_proxy)
+    except Exception:
+        return False
+
+
+def _nh_lodfilename(o):
+    for raw in (
+        getattr(o, "name", ""),
+        getattr(getattr(o, "data", None), "name", "")
+    ):
+        n = _nh_stripnum(raw)
+        if n.lower().endswith(".p3d"):
+            return n
+    return ""
+
+
+def _nh_proxy_mesh():
+    # Kept from the original NH Proxy Tool.
+    m = bpy.data.meshes.get("NH_ProxyTool_A3OB_Proxy")
+    if not m:
+        m = bpy.data.meshes.new("NH_ProxyTool_A3OB_Proxy")
+        m.from_pydata(
+            [(0.0, 0.0, 0.0), (0.0, 0.0, 2.0), (0.0, 1.0, 0.0)],
+            [],
+            [(0, 1, 2)]
+        )
+        m.update(calc_edges=True)
+    return m
+
+
+def _nh_nextidx(parent):
+    used = set()
+
+    for o in bpy.data.objects:
+        if o.parent != parent:
+            continue
+        try:
+            if o.a3ob_properties_object_proxy.is_a_proxy:
+                used.add(int(o.a3ob_properties_object_proxy.proxy_index))
+        except Exception:
+            pass
+
+    i = 1
+    while i in used:
+        i += 1
+    return i
+
+
+def _nh_arma_path(p):
+    p = _nh_norm(p).replace("/", "\\")
+    if p.lower().startswith("p:\\"):
+        return p
+
+    while p.startswith("\\"):
+        p = p[1:]
+
+    return "P:\\" + p
+
+
+def _nh_setproxy(pr, path, i):
+    try:
+        pg = pr.a3ob_properties_object_proxy
+    except Exception as e:
+        raise RuntimeError("A3OB is not enabled.") from e
+
+    pg.is_a_proxy = True
+    pg.proxy_path = _nh_arma_path(path)
+    pg.proxy_index = i
+    pr.display_type = "WIRE"
+    pr.show_name = True
+    pr.name = f"proxy: {os.path.splitext(os.path.basename(path))[0]} {i}"
+    pr.data.name = pr.name
+
+    try:
+        pr.a3ob_properties_object.is_a_lod = False
+    except Exception:
+        pass
+
+
+def _nh_create_proxy(source, target, path):
+    # IMPORTANT: this is the original NH Proxy Tool creation logic.
+    # Do not replace with A3OB's generic create_proxy() utility: the NH tool
+    # intentionally preserves the source world transform and then parents
+    # the new proxy to the selected target LOD.
+    col = (
+        target.users_collection[0]
+        if target.users_collection
+        else bpy.context.scene.collection
+    )
+    pr = bpy.data.objects.new("NH Proxy", _nh_proxy_mesh())
+    col.objects.link(pr)
+
+    # Preserve the exact world transform of the placed NH asset/extracted LOD.
+    # Parent is assigned without altering that world transform.
+    pr.matrix_world = source.matrix_world.copy()
+    pr.parent = target
+    try:
+        pr.matrix_parent_inverse = target.matrix_world.inverted()
+    except Exception:
+        pass
+
+    i = _nh_nextidx(target)
+    _nh_setproxy(pr, path, i)
+    pr["nh_proxy_source_object"] = source.name
+    pr["nh_proxy_source_p3d"] = _nh_arma_path(path)
+    return pr
+
+
+class A3OB_ProxyCreateSettings(bpy.types.PropertyGroup):
+    target_lod: bpy.props.PointerProperty(
+        name="Target LOD",
+        type=bpy.types.Object
+    )
+    p3d_root: bpy.props.StringProperty(
+        name="P3D Search Root",
+        subtype="DIR_PATH",
+        default="P:\\"
+    )
+    delete_originals: bpy.props.BoolProperty(
+        name="Delete originals",
+        default=True
+    )
+
+
+class A3OB_OT_proxy_create(bpy.types.Operator):
+    """Convert selected NH assets / extracted A3OB LODs to A3OB proxies."""
+
+    bl_idname = "a3ob.proxy_create"
+    bl_label = "Create Proxy"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT"
+
+    def execute(self, context):
+        settings = context.scene.a3ob_proxy_create_settings
+        target = settings.target_lod
+
+        if not target:
+            self.report({"ERROR"}, "Choose Target LOD first.")
+            return {"CANCELLED"}
+
+        if not _nh_islod(target):
+            self.report({"ERROR"}, "Target must be an A3OB LOD object.")
+            return {"CANCELLED"}
+
+        sources = []
+        bad = []
+
+        for o in list(context.selected_objects):
+            if o == target or _nh_isproxy(o):
+                continue
+
+            if _nh_islod(o):
+                n = _nh_lodfilename(o)
+                if not n:
+                    bad.append(o.name + ": P3D filename not found")
+                    continue
+
+                ms = _nh_findp3d(
+                    settings.p3d_root,
+                    _nh_basename_key(n)
+                )
+
+                if len(ms) == 1:
+                    sources.append((o, ms[0]))
+                elif not ms:
+                    bad.append(o.name + ": " + n + " not found")
+                else:
+                    bad.append(
+                        o.name + ": " + n + " has multiple matches"
+                    )
+            else:
+                r = _nh_resolve_nh(o, settings.p3d_root)
+
+                if isinstance(r, tuple):
+                    bad.append(o.name + ": " + r[1])
+                elif r:
+                    sources.append((o, r))
+                else:
+                    bad.append(o.name + ": NH source P3D not found")
+
+        if not sources:
+            self.report({"ERROR"}, "No convertible selected objects found.")
+            return {"CANCELLED"}
+
+        made = []
+        failed = []
+
+        for o, p in sources:
+            try:
+                made.append((o, _nh_create_proxy(o, target, p)))
+            except Exception as e:
+                failed.append(o.name + ": " + str(e))
+
+        if settings.delete_originals:
+            for o, _ in made:
+                if o.name in bpy.data.objects:
+                    try:
+                        bpy.data.objects.remove(o, do_unlink=True)
+                    except Exception:
+                        pass
+
+        bpy.ops.object.select_all(action="DESELECT")
+
+        for _, p in made:
+            p.select_set(True)
+
+        if made:
+            context.view_layer.objects.active = made[-1][1]
+
+        issues = bad + failed
+
+        if issues:
+            self.report(
+                {"WARNING"},
+                f"Created {len(made)} proxies; {len(issues)} skipped/failed. "
+                f"{issues[0]}"
+            )
+        else:
+            self.report(
+                {"INFO"},
+                f"Created {len(made)} A3OB proxies."
+            )
+
+        return {"FINISHED"}
+
+
+class A3OB_OT_proxy_browse_root(bpy.types.Operator):
+    """Choose the root folder used to find source P3D files."""
+
+    bl_idname = "a3ob.proxy_browse_root"
+    bl_label = "Browse P3D Root"
+
+    directory: bpy.props.StringProperty(subtype="DIR_PATH")
+
+    def execute(self, context):
+        context.scene.a3ob_proxy_create_settings.p3d_root = self.directory
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
 
 
 class A3OB_OT_proxy_realign_ocs(bpy.types.Operator):
@@ -93,11 +488,11 @@ class A3OB_OT_proxy_align_object(bpy.types.Operator):
 
 class A3OB_OT_proxy_extract(bpy.types.Operator):
     """Import 1st LOD of proxy model in place of proxy object"""
-    
+
     bl_idname = "a3ob.proxy_extract"
     bl_label = "Extract Proxy"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     enclose: bpy.props.BoolProperty()
     groupby: bpy.props.EnumProperty(default='NONE', items=(('NONE', "", ""),))
     additional_data_allowed: bpy.props.BoolProperty(default=True)
@@ -122,35 +517,62 @@ class A3OB_OT_proxy_extract(bpy.types.Operator):
     sections: bpy.props.EnumProperty(items=(("PRESERVE", "", ""),), default="PRESERVE")
     absolute_paths: bpy.props.BoolProperty(default=True)
     filepath: bpy.props.StringProperty()
-    
+
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        if not obj:
+        selected = context.selected_objects
+        if not selected:
             return False
-            
-        path = utils.abspath(obj.a3ob_properties_object_proxy.proxy_path)
-        return obj.type == 'MESH' and len(context.selected_objects) == 1 and obj.a3ob_properties_object_proxy.is_a3_proxy and os.path.exists(path) and os.path.splitext(path)[1].lower() == '.p3d'
-    
+
+        # Extract can operate on one or several selected proxies.
+        # Every selected object must be a valid P3D proxy with an existing .p3d file.
+        for obj in selected:
+            if obj.type != 'MESH' or not obj.a3ob_properties_object_proxy.is_a3_proxy:
+                return False
+
+            path = utils.abspath(obj.a3ob_properties_object_proxy.proxy_path)
+            if not os.path.exists(path) or os.path.splitext(path)[1].lower() != '.p3d':
+                return False
+
+        return True
+
     def execute(self, context):
-        proxy_object = context.active_object
-        self.filepath = utils.abspath(proxy_object.a3ob_properties_object_proxy.proxy_path)
-        with open(self.filepath, "rb") as file:
+        proxy_objects = context.selected_objects.copy()
+        extracted = 0
+        failed = 0
+
+        # read_file() clears the current selection, so keep our own copy above.
+        for proxy_object in proxy_objects:
+            self.filepath = utils.abspath(proxy_object.a3ob_properties_object_proxy.proxy_path)
+
             try:
-                lod_objects = import_p3d.read_file(self, context, file)
+                with open(self.filepath, "rb") as file:
+                    lod_objects = import_p3d.read_file(self, context, file)
+
                 imported_object = lod_objects[0]
                 imported_object.matrix_world = proxy_object.matrix_world
                 imported_object.name = os.path.basename(self.filepath)
                 imported_object.data.name = os.path.basename(self.filepath)
+
                 bpy.data.meshes.remove(proxy_object.data)
-                self.report({'INFO'}, "Successfully extracted proxy (check the logs in the system console)")
-            except struct.error as ex:
-                self.report({'ERROR'}, "Unexpected EndOfFile (check the system console)")
+                extracted += 1
+
+            except struct.error:
+                failed += 1
+                self.report({'ERROR'}, "Unexpected EndOfFile: %s (check the logs in the system console)" % self.filepath)
                 traceback.print_exc()
             except Exception as ex:
-                self.report({'ERROR'}, "%s (check the system console)" % ex)
+                failed += 1
+                self.report({'ERROR'}, "%s (check the logs in the system console)" % ex)
                 traceback.print_exc()
-        
+
+        if failed == 0:
+            self.report({'INFO'}, "Successfully extracted %d prox%s (check the logs in the system console)" %
+                        (extracted, "y" if extracted == 1 else "ies"))
+        else:
+            self.report({'WARNING'}, "Extracted %d prox%s, %d failed (check the logs in the system console)" %
+                        (extracted, "y" if extracted == 1 else "ies", failed))
+
         return {'FINISHED'}
 
 
@@ -340,6 +762,17 @@ class A3OB_PT_proxies(bpy.types.Panel):
         col_align.operator("a3ob.proxy_align_object", icon_value=get_icon("op_proxy_align_object"))
         layout.operator("a3ob.proxy_realign_ocs", icon_value=get_icon("op_proxy_realign"))
         layout.operator("a3ob.proxy_extract", icon_value=get_icon("op_proxy_extract"))
+
+        scene_props = context.scene.a3ob_proxy_create_settings
+        box = layout.box()
+        box.label(text="Create Proxy")
+        box.prop(scene_props, "target_lod", text="Target")
+        row = box.row(align=True)
+        row.prop(scene_props, "p3d_root", text="P3D Root")
+        row.operator("a3ob.proxy_browse_root", text="", icon="FILE_FOLDER")
+        box.prop(scene_props, "delete_originals")
+        box.operator("a3ob.proxy_create", icon="CONSTRAINT")
+
         col_move = layout.column(align=True)
         col_move.operator("a3ob.proxy_copy", icon_value=get_icon("op_proxy_copy"))
         col_move.operator("a3ob.proxy_copy_all", icon_value=get_icon("op_proxy_copy_all"))
@@ -355,10 +788,13 @@ class A3OB_UL_lod_objects_selector(bpy.types.UIList):
 
 
 classes = (
+    A3OB_ProxyCreateSettings,
     A3OB_OT_proxy_align,
     A3OB_OT_proxy_align_object,
     A3OB_OT_proxy_realign_ocs,
     A3OB_OT_proxy_extract,
+    A3OB_OT_proxy_create,
+    A3OB_OT_proxy_browse_root,
     A3OB_OT_proxy_copy,
     A3OB_OT_proxy_copy_all,
     A3OB_OT_proxy_transfer,
@@ -370,12 +806,19 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
+
+    bpy.types.Scene.a3ob_proxy_create_settings = bpy.props.PointerProperty(
+        type=A3OB_ProxyCreateSettings
+    )
+
     print("\t" + "UI: Proxies")
 
 
 def unregister():
+    if hasattr(bpy.types.Scene, "a3ob_proxy_create_settings"):
+        del bpy.types.Scene.a3ob_proxy_create_settings
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    
+
     print("\t" + "UI: Proxies")

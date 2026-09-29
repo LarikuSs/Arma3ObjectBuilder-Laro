@@ -23,6 +23,7 @@ class Settings:
     filepath = r""
     # Attempt to restore relative file paths
     relative_paths = True
+    absolute_paths = True
     # Create collection with P3D name
     enclose = True
     # Group LODs by: 'NONE' or 'TYPE'
@@ -41,6 +42,8 @@ class Settings:
         'UV',           # additional UV sets
         'MATERIALS'     # material
     }
+    # Create material preview node trees and load referenced PAA textures
+    load_textures = True
     # Validate and cleanup imported meshes with degenerated geometry
     validate_meshes = False
     # Postprocess proxies: 'NOTHING', 'SEPARATE' or 'CLEAR'

@@ -10,13 +10,24 @@ from . import compat as computils
 
 
 def clear_components(obj):
-    re_component = re.compile("component\d+", re.IGNORECASE)
+    re_component = re.compile(r"^component\d+$", re.IGNORECASE)
     vgroups = [group for group in obj.vertex_groups if re_component.match(group.name)]
     while vgroups:
         obj.vertex_groups.remove(vgroups.pop())
 
 
 def find_components(obj):
+    # Component generation must operate on the actual LOD object, not on
+    # whichever proxy/sub-object happens to be active after preprocessing.
+    # Proxies are merged only after validation and must remain proxies; their
+    # triangles must never become Component## selections.
+    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
+        utils.force_mode_object()
+
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
     utils.force_mode_object()
     
     clear_components(obj)

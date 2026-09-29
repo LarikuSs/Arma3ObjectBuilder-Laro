@@ -5,6 +5,7 @@
 
 import time
 import re
+import math
 from contextlib import contextmanager
 
 import bpy
@@ -277,6 +278,25 @@ def cleanup_uvs(obj):
         utils.clear_uvs(obj)
 
 
+def cleanup_lod_materials(obj):
+    """Remove material assignments from LODs where materials have no meaning.
+
+    Face material indices are reset before clearing the material slots. This is
+    important because the P3D exporter always looks up a material by face index.
+    Fire Geometry is intentionally left untouched and is validated separately.
+    """
+    lod = int(obj.a3ob_properties_object.lod)
+    if lod in {
+        data.LOD.GEOMETRY,
+        data.LOD.VIEW_GEOMETRY,
+        *data.lod_shadows,
+        data.LOD.MEMORY,
+    }:
+        for polygon in obj.data.polygons:
+            polygon.material_index = 0
+        obj.data.materials.clear()
+
+
 def cleanup_normals(operator, obj):
     if not operator.preserve_normals or int(obj.a3ob_properties_object.lod) not in data.lod_visuals:
         ctx = {
@@ -292,15 +312,76 @@ def cleanup_normals(operator, obj):
 
 
 def generate_components(operator, obj):
-    if not operator.generate_components or int(obj.a3ob_properties_object.lod) not in data.lod_geometries:
+    """Rebuild Component## selections from the actual mesh topology.
+
+    Geometry-type LODs are always rebuilt at export time. Existing Component##
+    groups are deliberately discarded; every other named selection is kept.
+    This prevents stale component selections from surviving after topology
+    changes.
+    """
+    lod = int(obj.a3ob_properties_object.lod)
+    if lod not in data.lod_geometries:
         return
-    
-    re_component = re.compile(r"component\d+", re.IGNORECASE)
-    for group in obj.vertex_groups:
-        if re_component.match(group.name):
-            return
-    
+
+    # Component selections are derived data. Always regenerate them for
+    # geometry LODs, regardless of the export UI checkbox.
     structutils.find_components(obj)
+
+
+def validate_geometry_mass_for_export(obj):
+    """Hard export-time mass check for Geometry LODs.
+
+    Do not use Component## selections here. They are regenerated separately
+    and can be stale/missing before export. Instead, inspect every physically
+    disconnected mesh component and sum its vertex masses. A component with
+    zero total mass is invalid even when another component has valid mass.
+    """
+    if int(obj.a3ob_properties_object.lod) != data.LOD.GEOMETRY:
+        return
+
+    mesh = obj.data
+    mesh.calc_loop_triangles()
+    chunks = utils.meshutils.mesh_linked_triangles(mesh) if hasattr(utils, 'meshutils') else None
+
+    # generic.py imports meshutils internally, but it is not exposed as a
+    # module attribute in every build. get_loose_components is the public
+    # helper and uses the same topology algorithm.
+    component_verts, _ = utils.get_loose_components(obj)
+
+    layer = None
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        layer = bm.verts.layers.float.get("a3ob_mass")
+
+        if layer is None:
+            raise p3d.P3D_Error(
+                "Geometry LOD '%s' has no vertex mass data assigned" % obj.name
+            )
+
+        unused = [v.index for v in bm.verts if not v.link_faces]
+        if unused:
+            preview = ", ".join(str(i) for i in unused[:10])
+            suffix = "..." if len(unused) > 10 else ""
+            raise p3d.P3D_Error(
+                "Geometry LOD '%s' has %d unused vertices (indices: %s%s)" %
+                (obj.name, len(unused), preview, suffix)
+            )
+
+        failures = []
+        for number, vertex_indices in enumerate(component_verts, 1):
+            mass = math.fsum(bm.verts[i][layer] for i in vertex_indices)
+            if mass < 0.001:
+                failures.append("Component%02d (mass %.3f)" % (number, mass))
+
+        if failures:
+            raise p3d.P3D_Error(
+                "Geometry LOD '%s' has components with no mass: %s" %
+                (obj.name, ", ".join(failures))
+            )
+    finally:
+        bm.free()
 
 
 # Needed to get around the validator requiring component## selections. If the
@@ -351,13 +432,65 @@ def get_lod_data(operator, context, validator, temp_collection):
         merge_sub_objects(operator, main_obj, sub_objects)
         is_valid = validate_proxies(operator, proxy_objects)
 
+        # Prepare the actual export LOD before validation. Component## selections are
+        # rebuilt from topology, so stale manually-created Component groups can never
+        # make validation pass for the wrong geometry.
+        cleanup_uvs(main_obj)
+        generate_components(operator, main_obj)
+        validate_geometry_mass_for_export(main_obj)
+        cleanup_lod_materials(main_obj)
+
         is_valid_copies = []
         for copy in main_obj.a3ob_properties_object.copies:
-            with temporary_component(operator, main_obj):
-                is_valid_copies.append(is_valid and validator.validate_lod(main_obj, copy.lod, True, operator.validate_lods_warning_errors and operator.validate_lods, operator.relative_paths))
+            validation_copy = duplicate_object(main_obj, temp_collection)
+            copy_props = validation_copy.a3ob_properties_object
+            copy_props.lod = copy.lod
+            copy_props.resolution = copy.resolution
+            copy_props.resolution_float = copy.resolution_float
 
-        with temporary_component(operator, main_obj):
-            is_valid &= validator.validate_lod(main_obj, main_obj.a3ob_properties_object.lod, True, operator.validate_lods_warning_errors and operator.validate_lods, operator.relative_paths)
+            cleanup_uvs(validation_copy)
+            generate_components(operator, validation_copy)
+            cleanup_lod_materials(validation_copy)
+            copy_validation_ok = validator.validate_lod(
+                validation_copy, copy.lod, False,
+                operator.validate_lods_warning_errors and operator.validate_lods,
+                operator.relative_paths
+            )
+            copy_valid = is_valid and copy_validation_ok
+            if operator.validate_lods and not copy_valid:
+                reasons = list(getattr(validator, "last_errors", []))
+                if not is_valid and not reasons:
+                    reasons.append("source LOD failed an export prerequisite before copied-LOD validation")
+                reason_text = "; ".join(dict.fromkeys(r for r in reasons if r))
+                raise p3d.P3D_Error(
+                    "Export failed: copied LOD '%s' failed validation%s" %
+                    (validation_copy.name, (": " + reason_text) if reason_text else "")
+                )
+            is_valid_copies.append(copy_valid)
+
+        is_valid &= validator.validate_lod(
+            main_obj, main_obj.a3ob_properties_object.lod, False,
+            operator.validate_lods_warning_errors and operator.validate_lods,
+            operator.relative_paths
+        )
+
+        # Validation failure is an export failure. Never silently omit a bad
+        # LOD and produce a partial P3D. Surface the concrete validation
+        # reasons collected by Validator.
+        if operator.validate_lods and not is_valid:
+            reasons = getattr(validator, "last_errors", [])
+            if reasons:
+                unique = []
+                for reason in reasons:
+                    if reason and reason not in unique:
+                        unique.append(reason)
+                raise p3d.P3D_Error(
+                    "Export failed: LOD '%s' failed validation: %s" %
+                    (main_obj.name, "; ".join(unique))
+                )
+            raise p3d.P3D_Error(
+                "Export failed: LOD '%s' failed validation" % main_obj.name
+            )
 
         proxy_lookup = merge_proxy_objects(main_obj, proxy_objects, operator.relative_paths)
 
@@ -383,12 +516,18 @@ def get_lod_data(operator, context, validator, temp_collection):
 
             cleanup_uvs(main_obj_copy)
             cleanup_normals(operator, main_obj_copy)
-            generate_components(operator, main_obj_copy)
+            # Do not regenerate components here. Proxies have already been
+            # merged into main_obj, and proxy triangles must not be turned
+            # into Component## selections. Components were generated before
+            # proxy merge, so their selections already exclude proxy geometry.
+            cleanup_lod_materials(main_obj_copy)
             lod_list.append((main_obj_copy, proxy_lookup, is_valid_copy))
             
         cleanup_uvs(main_obj)
         cleanup_normals(operator, main_obj)
-        generate_components(operator, main_obj)
+        # Components were generated before merge_proxy_objects(). Keep those
+        # selections intact so proxy geometry remains proxy geometry.
+        cleanup_lod_materials(main_obj)
         lod_list.append((main_obj, proxy_lookup, is_valid))
 
     return lod_list
@@ -600,8 +739,9 @@ def process_lod(operator, obj, proxy_lookup, is_valid, processed_signatures, log
     logger.step("Type: %s" % lod_name)
 
     if not is_valid:
-        logger.step(">> Failed validation -> skipping LOD (run manual validation for details)")
-        return None
+        raise p3d.P3D_Error(
+            "Export failed: LOD '%s' failed validation (see validation log for details)" % lod_name
+        )
 
     logger.start_subproc("Processing data:")
     output = p3d.P3D_LOD()

@@ -11,6 +11,7 @@ import bmesh
 import mathutils
 
 from . import data_p3d as p3d
+from . import import_paa
 from ..utilities import generic as utils
 from ..utilities import lod as lodutils
 from ..utilities import compat as computils
@@ -50,8 +51,197 @@ def categorize_lods(operator, context, mlod):
     return [cat[1] for cat in categories.values()], lods
 
 
-def create_blender_materials(lookup, absolute):
+def enable_material_alpha(material):
+    try:
+        material.blend_method = 'HASHED'
+    except Exception:
+        pass
+
+    try:
+        material.shadow_method = 'HASHED'
+    except Exception:
+        pass
+
+
+def resolve_texture_path(texture_path):
+    texture_path = texture_path.strip()
+    if texture_path == "":
+        return ""
+
+    candidates = []
+
+    if os.path.isabs(texture_path) or texture_path.startswith("//"):
+        candidate = utils.abspath(texture_path)
+        candidates.append(candidate)
+
+        if os.path.splitext(candidate)[1] == "":
+            candidates.append(candidate + ".paa")
+
+    candidates.append(utils.restore_absolute(texture_path))
+    candidates.append(utils.restore_absolute(texture_path, ".paa"))
+
+    checked = set()
+    for candidate in candidates:
+        if candidate == "":
+            continue
+
+        if not os.path.isabs(candidate) and not candidate.startswith("//"):
+            continue
+
+        candidate = os.path.abspath(bpy.path.abspath(candidate))
+        key = candidate.lower()
+        if key in checked:
+            continue
+
+        checked.add(key)
+        if os.path.isfile(candidate):
+            return candidate
+
+    return ""
+
+
+def load_texture_image(texture_path):
+    resolved_path = resolve_texture_path(texture_path)
+    if resolved_path == "":
+        return None, False, ""
+
+    if os.path.splitext(resolved_path)[1].lower() == ".paa":
+        try:
+            image, tex = import_paa.load_file(resolved_path, 'SRGB')
+        except Exception:
+            return None, False, resolved_path
+
+        if image is None:
+            return None, False, resolved_path
+
+        has_alpha = tex.type == import_paa.paa.PAA_Type.DXT5 if tex is not None else image.alpha_mode != 'NONE'
+        return image, has_alpha, resolved_path
+
+    try:
+        image = bpy.data.images.load(resolved_path, check_existing=True)
+    except Exception:
+        return None, False, resolved_path
+
+    return image, image.alpha_mode != 'NONE', resolved_path
+
+
+def setup_material_nodes(material, logger=None):
+    props = material.a3ob_properties_material
+
+    # --------------------------------------------------------
+    # Resolve preview before destroying existing node tree
+    # --------------------------------------------------------
+
+    image = None
+    has_alpha = False
+    resolved_path = ""
+
+    mode = 'DEFAULT'
+
+    if props.texture_type == 'COLOR':
+        mode = 'COLOR'
+
+    elif props.texture_type == 'TEX' and props.texture_path.strip():
+        image, has_alpha, resolved_path = load_texture_image(props.texture_path)
+
+        if image is None:
+            if logger:
+                logger.step(
+                    ">> Material preview texture not found: %s"
+                    % props.texture_path
+                )
+
+            # IMPORTANT:
+            # Keep current Blender material intact.
+            return 'MISSING'
+
+        mode = 'TEXTURE'
+
+    # --------------------------------------------------------
+    # Only now destroy existing nodes
+    # --------------------------------------------------------
+
+    material.use_nodes = True
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    nodes.clear()
+
+    node_output = nodes.new("ShaderNodeOutputMaterial")
+    node_output.location = (300, 0)
+
+    node_shader = nodes.new("ShaderNodeBsdfPrincipled")
+    node_shader.location = (0, 0)
+
+    links.new(
+        node_shader.outputs["BSDF"],
+        node_output.inputs["Surface"]
+    )
+
+    # --------------------------------------------------------
+    # Solid color
+    # --------------------------------------------------------
+
+    if mode == 'COLOR':
+
+        node_color = nodes.new("ShaderNodeRGB")
+        node_color.location = (-250, 0)
+
+        node_color.outputs[0].default_value = (
+            props.color_value[0],
+            props.color_value[1],
+            props.color_value[2],
+            1.0
+        )
+
+        links.new(
+            node_color.outputs[0],
+            node_shader.inputs["Base Color"]
+        )
+
+        node_shader.inputs["Alpha"].default_value = props.color_value[3]
+
+        if props.color_value[3] < 1.0:
+            enable_material_alpha(material)
+
+        return 'COLOR'
+
+    # --------------------------------------------------------
+    # Empty material
+    # --------------------------------------------------------
+
+    if mode == 'DEFAULT':
+        return 'DEFAULT'
+
+    # --------------------------------------------------------
+    # Texture preview
+    # --------------------------------------------------------
+
+    node_texture = nodes.new("ShaderNodeTexImage")
+    node_texture.location = (-300, 0)
+
+    node_texture.image = image
+    node_texture.label = os.path.basename(resolved_path)
+
+    links.new(
+        node_texture.outputs["Color"],
+        node_shader.inputs["Base Color"]
+    )
+
+    if has_alpha:
+        links.new(
+            node_texture.outputs["Alpha"],
+            node_shader.inputs["Alpha"]
+        )
+        enable_material_alpha(material)
+
+    return 'TEXTURE'
+
+def create_blender_materials(lookup, absolute, with_preview=False, logger=None):
     materials = []
+    preview_loaded = 0
+    preview_missing = 0
     
     for texture, material in lookup.keys():
         material_name = "P3D: %s :: %s" % (os.path.basename(texture), os.path.basename(material))
@@ -60,9 +250,17 @@ def create_blender_materials(lookup, absolute):
             
         new_mat = bpy.data.materials.new(material_name)
         new_mat.a3ob_properties_material.from_p3d(texture.strip(), material.strip(), absolute)
+
+        if with_preview:
+            status = setup_material_nodes(new_mat, logger)
+            if status == 'TEXTURE':
+                preview_loaded += 1
+            elif status == 'MISSING':
+                preview_missing += 1
+
         materials.append(new_mat)
         
-    return materials
+    return materials, preview_loaded, preview_missing
 
 
 def process_normals(mesh, lod):
@@ -386,6 +584,11 @@ def process_lod(operator, logger, lod, materials, materials_lookup, categories, 
     bm.to_mesh(mesh)
     bm.free()
 
+    uv_layer = mesh.uv_layers.get("UVSet 0")
+    if uv_layer is not None:
+        uv_layer.active = True
+        uv_layer.active_render = True
+
     collection = categories[lod_links[2]]
     collection.objects.link(obj)
 
@@ -444,9 +647,14 @@ def read_file(operator, context, file):
     materials_lookup = None
     if 'MATERIALS' in operator.additional_data:
         materials_lookup = mlod.get_materials()
-        materials = create_blender_materials(materials_lookup, operator.absolute_paths)
+        load_textures = getattr(operator, "load_textures", True)
+        materials, preview_loaded, preview_missing = create_blender_materials(materials_lookup, operator.absolute_paths, load_textures, logger)
         logger.step("Number of unique materials: %d" % len(materials))
-    
+        if load_textures:
+            logger.step("Material previews loaded: %d" % preview_loaded)
+            if preview_missing > 0:
+                logger.step("Material previews missing: %d" % preview_missing)
+
     logger.start_subproc("Processing mesh data:")
 
     lod_objects = []

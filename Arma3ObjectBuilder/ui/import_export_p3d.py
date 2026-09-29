@@ -2,7 +2,7 @@ import bpy
 import bpy_extras
 
 from .. import get_prefs
-from ..io import import_p3d, export_p3d
+from ..io import import_p3d, export_p3d, data_p3d as p3d
 from ..utilities import generic as utils
 
 
@@ -91,6 +91,11 @@ class A3OB_OP_import_p3d(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
             ('MERGE', "Merge", "Merge sections with identical texture-material pair")
         ),
         default = 'PRESERVE'
+    )
+    load_textures: bpy.props.BoolProperty(
+        name = "Load PAA Textures",
+        description = "Create preview nodes for imported materials and load referenced PAA textures so they are visible in Blender",
+        default = True
     )
     
     def draw(self, context):
@@ -182,8 +187,11 @@ class A3OB_PT_import_p3d_data(bpy.types.Panel):
         col_enum.prop(operator, "additional_data", text=" ") # text=" " otherwise the enum is stretched accross the panel
         row_sections = layout.row(align=True)
         row_sections.prop(operator, "sections", expand=True)
+        row_textures = layout.row()
+        row_textures.prop(operator, "load_textures")
         if not operator.additional_data_allowed or 'MATERIALS' not in operator.additional_data:
             row_sections.enabled = False
+            row_textures.enabled = False
 
 
 class A3OB_PT_import_p3d_post(bpy.types.Panel):
@@ -288,7 +296,7 @@ class A3OB_OP_export_p3d(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
     )
     validate_lods: bpy.props.BoolProperty(
         name = "Validate LODs",
-        description = "Validate LOD objects, and skip the export of invalid ones"
+        description = "Validate LOD objects; abort the export if any LOD is invalid"
     )
     validate_lods_warning_errors: bpy.props.BoolProperty(
         name = "Warnings Are Errors",
@@ -310,7 +318,7 @@ class A3OB_OP_export_p3d(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
     )
     generate_components: bpy.props.BoolProperty(
         name = "Generate Components",
-        description = "Generate Component## selections if none are already defined",
+        description = "Rebuild Component## selections from the actual disconnected geometry (existing Component## selections are replaced)",
         default = True
     )
 
@@ -333,6 +341,10 @@ class A3OB_OP_export_p3d(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
                     utils.op_report(self, {'INFO'}, "Successfully exported all %d LODs (check the logs in the system console)" % exported_count)
                 else:
                     utils.op_report(self, {'WARNING'}, "Only exported %d/%d LODs (check the logs in the system console)" % (exported_count, lod_count))
+
+            except p3d.P3D_Error as error:
+                utils.op_report(self, {'ERROR'}, str(error))
+                return {'CANCELLED'}
 
             finally:
                 if not get_prefs().preserve_preprocessed_lods:

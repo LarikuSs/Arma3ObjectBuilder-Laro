@@ -3,11 +3,13 @@
 
 import re
 import math
+import os
 
 import bmesh
 import bpy
 
 from .data import LOD
+from . import generic as utils
 
 
 class ValidatorResult():
@@ -62,6 +64,8 @@ class ValidatorComponent():
         for item in strict:
             result = item()
             if not result:
+                if hasattr(self, "validation_errors") and result.comment:
+                    self.validation_errors.append(result.comment)
                 self.logger.step("ERROR: %s" % result.comment)
                 is_valid = False
         
@@ -69,6 +73,10 @@ class ValidatorComponent():
             result = item()
             if not result:
                 self.logger.step("WARNING: %s" % result.comment)
+                # When warnings are configured as errors, the exact reason
+                # must be propagated to the exporter as well.
+                if warns_errs and hasattr(self, "validation_errors") and result.comment:
+                    self.validation_errors.append("warning treated as error: %s" % result.comment)
                 is_valid &= not warns_errs
         
         for item in info:
@@ -99,6 +107,7 @@ class ValidatorComponentLOD(ValidatorComponent):
         self.bm = bm
         self.logger = logger
         self.relative_paths = relative_paths
+        self.validation_errors = []
 
     def is_contiguous(self):
         result = ValidatorResult()
@@ -225,6 +234,15 @@ class ValidatorLODGeometry(ValidatorComponentLOD):
             result.set(False, "mesh is not triangulated (convexity is not definite)")
         
         return result
+
+    def no_unused_vertices(self):
+        unused = [vert.index for vert in self.bm.verts if not vert.link_faces]
+        if unused:
+            preview = ", ".join(str(index) for index in unused[:10])
+            suffix = "..." if len(unused) > 10 else ""
+            return ValidatorResult(False, "mesh has %d unused vertices (indices: %s%s)" % (len(unused), preview, suffix))
+
+        return ValidatorResult(True)
     
     def is_convex_edge_internal(self, edge):
         if edge.is_convex:
@@ -252,7 +270,7 @@ class ValidatorLODGeometry(ValidatorComponentLOD):
     def has_components(self):
         result = ValidatorResult()
 
-        if not self.has_selection_internal("component\d+"):
+        if not self.has_selection_internal("^component\d+$"):
             result.set(False, "mesh has no component selections")
         
         return result
@@ -266,6 +284,48 @@ class ValidatorLODGeometry(ValidatorComponentLOD):
 
         return result
     
+    def all_components_have_mass(self):
+        """Verify mass on every actual disconnected mesh component.
+
+        This deliberately does not rely on Component## named selections. A mesh
+        component can be missing from the named selections (for example, when
+        geometry was added after the selections were created), but it still must
+        have mass. Component## selections are generated separately during export.
+        """
+        result = ValidatorResult()
+
+        layer = self.bm.verts.layers.float.get("a3ob_mass")
+        if not layer:
+            result.set(False, "mesh has no vertex mass layer assigned")
+            return result
+
+        # Work from the actual mesh topology, not from existing Component##
+        # selections. get_loose_components() returns every disconnected face
+        # component, including components that are not closed and therefore may
+        # have been ignored by Find Components.
+        component_verts, _ = utils.get_loose_components(self.obj)
+
+        if not component_verts:
+            # No faces/components: the regular geometry checks will report the
+            # structural problem, but don't let this mass check pass silently.
+            result.set(False, "mesh has no geometry components")
+            return result
+
+        failures = []
+        for index, vertex_indices in enumerate(component_verts, 1):
+            mass = math.fsum(self.bm.verts[i][layer] for i in vertex_indices)
+            if mass < 0.001:
+                # Prefer the generated Component## name when it exists, but the
+                # numbering here is based on actual topology, so newly added
+                # components are also reported even if no Component## selection
+                # existed beforehand.
+                failures.append("Component%02d (mass %.3f)" % (index, mass))
+
+        if failures:
+            result.set(False, "component(s) have no vertex mass assigned: %s" % ", ".join(failures))
+
+        return result
+
     def no_unweighted(self):
         result = ValidatorResult()
 
@@ -292,7 +352,9 @@ class ValidatorLODGeometry(ValidatorComponentLOD):
     def conditions(self):
         strict = (
             self.is_convex,
-            self.has_mass
+            self.has_mass,
+            self.all_components_have_mass,
+            self.no_unused_vertices
         )
         if not self.has_selection_internal("occluder\d+"):
             strict = (
@@ -331,6 +393,50 @@ class ValidatorLODGeometrySubtype(ValidatorLODGeometry):
 
         return strict, optional, info
     
+
+class ValidatorLODFireGeometry(ValidatorLODGeometrySubtype):
+    """LOD - Fire Geometry"""
+
+    @staticmethod
+    def _normalize_path(path):
+        return path.replace("/", "\\").strip().lower().rstrip("\\")
+
+    def _is_penetration_material(self, mat):
+        if not mat:
+            return False
+
+        props = mat.a3ob_properties_material
+        path = self._normalize_path(props.material_path)
+        if not path:
+            return False
+
+        # Fire Geometry accepts ONLY actual penetration RVMATs from the
+        # canonical DZ penetration directory.  Do not accept arbitrary RVMATs,
+        # relative paths, or materials merely containing a penetration-looking
+        # path fragment.
+        allowed_prefix = "p:\\dz\\data\\data\\penetration\\"
+        return path.startswith(allowed_prefix) and path.endswith(".rvmat")
+
+    def all_faces_have_penetration_material(self):
+        result = ValidatorResult()
+
+        for face in self.bm.faces:
+            if face.material_index >= len(self.obj.material_slots):
+                result.set(False, "Fire Geometry has faces with no material assigned")
+                break
+
+            mat = self.obj.material_slots[face.material_index].material
+            if not self._is_penetration_material(mat):
+                result.set(False, "Fire Geometry has faces without a DZ penetration RVMAT")
+                break
+
+        return result
+
+    def conditions(self):
+        strict, optional, info = super().conditions()
+        strict = (*strict, self.all_faces_have_penetration_material)
+        return strict, optional, info
+
 
 class ValidatorLODShadow(ValidatorComponentLOD):
     """LOD - Shadow"""
@@ -484,16 +590,36 @@ class ValidatorLODRoadway(ValidatorComponentLOD):
             if not mat:
                 textures[i] = ""
                 continue
-                
+
             textures[i] = mat.a3ob_properties_material.to_p3d(False)[0]
-        
+
         if len(textures) == 0:
-            result.set(False, "mesh has no sound textures assigned")
-        else:
-            for face in self.bm.faces:
-                if textures[face.material_index] == "":
-                    result.set(False, "mesh has faces with no sound texture assigned")
-                    break
+            result.set(False, "Roadway has no sound textures assigned")
+            return result
+
+        checked_paths = {}
+        for face in self.bm.faces:
+            mat_index = face.material_index
+            texture = textures.get(mat_index, "")
+
+            if texture == "":
+                result.set(False, "Roadway face %d has no sound texture assigned" % face.index)
+                break
+
+            texture_path = str(texture).replace("/", "\\").strip()
+            path_lower = texture_path.lower()
+
+            if path_lower.endswith(".rvmat"):
+                result.set(False, "Roadway sound texture must not be an RVMAT (face %d: %s)" % (face.index, texture_path))
+                break
+
+            if texture_path not in checked_paths:
+                resolved_path = utils.restore_absolute(texture_path)
+                checked_paths[texture_path] = resolved_path if resolved_path and os.path.isfile(resolved_path) else ""
+
+            if checked_paths[texture_path] == "":
+                result.set(False, "Roadway sound texture file does not exist (face %d: %s)" % (face.index, texture_path))
+                break
 
         return result
 
@@ -508,10 +634,10 @@ class ValidatorLODRoadway(ValidatorComponentLOD):
     def conditions(self):
         strict = (
             self.has_faces,
+            self.has_sound,
         )
         optional = (
             self.under_limit,
-            self.has_sound
         )
         info = (
             self.farthest_point,
@@ -691,6 +817,10 @@ class Validator():
     def __init__(self, logger):
         self.logger = logger
         self.components = {}
+        # Detailed failures from the most recent LOD validation. Export uses
+        # these messages to abort the whole P3D export instead of silently
+        # skipping an invalid LOD.
+        self.last_errors = []
     
     def setup_lod_specific(self):
         self.components = {
@@ -716,7 +846,6 @@ class Validator():
                     str(LOD.GEOMETRY_BUOY),
                     str(LOD.GEOMETRY_PHYSX),
                     str(LOD.VIEW_GEOMETRY),
-                    str(LOD.FIRE_GEOMETRY),
                     str(LOD.VIEW_CARGO_GEOMETRY),
                     str(LOD.VIEW_CARGO_FIRE_GEOMETRY),
                     str(LOD.VIEW_COMMANDER_GEOMETRY),
@@ -728,6 +857,7 @@ class Validator():
                 ),
                 [ValidatorLODGeometrySubtype]
             ),
+            str(LOD.FIRE_GEOMETRY): [ValidatorLODFireGeometry],
             str(LOD.GEOMETRY): [ValidatorLODGeometry],
             str(LOD.ROADWAY): [ValidatorLODRoadway],
             str(LOD.PATHS): [ValidatorLODPaths],
@@ -736,6 +866,7 @@ class Validator():
         }
 
     def validate_lod(self, obj, lod, lazy = False, warns_errs = True, relative_paths = False):
+        self.last_errors = []
         self.logger.start_subproc("Validating %s" % obj.name)
         if warns_errs:
             self.logger.step("Warnings are errors")
@@ -748,8 +879,47 @@ class Validator():
         bm.faces.ensure_lookup_table()
 
         is_valid = True
-        for item in [ValidatorLODGeneric] + self.components.get(lod, []):
-            is_valid &= item(obj, bm, self.logger, relative_paths).validate(lazy, warns_errs)
+
+        # Hard gate for Fire Geometry.  Do this directly in validate_lod so the
+        # rule cannot be skipped by a mismatched/unknown LOD component mapping.
+        # Every face using a material must use an RVMAT located strictly under
+        # P:\DZ\data\data\penetration\.  A CO.PAA or an RVMAT from any
+        # other directory is invalid.
+        try:
+            lod_id = int(str(lod).split('.')[0])
+        except (TypeError, ValueError):
+            lod_id = None
+
+        if lod_id == LOD.FIRE_GEOMETRY:
+            allowed_prefix = "p:\\dz\\data\\data\\penetration\\"
+            used_material_indices = {face.material_index for face in bm.faces}
+            for mat_index in used_material_indices:
+                if mat_index < 0 or mat_index >= len(obj.material_slots):
+                    message = "Fire Geometry has faces with no material assigned"
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+                    continue
+                mat = obj.material_slots[mat_index].material
+                raw_path = "" if mat is None else mat.a3ob_properties_material.material_path
+                path = str(raw_path or "").replace("/", "\\").strip().lower()
+                if not (path.startswith(allowed_prefix) and path.endswith(".rvmat")):
+                    display = path or "<empty>"
+                    message = (
+                        "Fire Geometry material must be an RVMAT under "
+                        "P:\\DZ\\data\\data\\penetration\\ (found: %s)" % display
+                    )
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+
+        for item in [ValidatorLODGeneric] + self.components.get(str(lod), []):
+            component_validator = item(obj, bm, self.logger, relative_paths)
+            component_validator.validation_errors = []
+            result = component_validator.validate(lazy, warns_errs)
+            if not result and getattr(component_validator, "validation_errors", None):
+                self.last_errors.extend(component_validator.validation_errors)
+            is_valid &= result
 
         bm.free()
         self.logger.step("Validation %s" % ("PASSED" if is_valid else "FAILED"))

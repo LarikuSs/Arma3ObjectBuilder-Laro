@@ -651,7 +651,7 @@ class P3D_LOD():
     def renumber_components(self):
         counter = 1
         for tagg in self.taggs:
-            if not re.match(r"component\d+", tagg.name, re.IGNORECASE):
+            if not re.match(r"^component\d+$", tagg.name, re.IGNORECASE):
                 continue
             
             tagg.name = "component%02d" % counter

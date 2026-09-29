@@ -1,6 +1,34 @@
 import bpy
 
+from ..io import import_p3d
 from ..utilities import generic as utils
+
+
+class A3OB_OT_material_preview_update(bpy.types.Operator):
+    """Create or refresh the Blender material preview from A3OB material properties"""
+
+    bl_label = "Update Preview"
+    bl_idname = "a3ob.material_preview_update"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return hasattr(context, "material") and context.material
+
+    def execute(self, context):
+        material = context.material
+        status = import_p3d.setup_material_nodes(material)
+
+        if status == 'TEXTURE':
+            self.report({'INFO'}, "Material texture preview updated")
+        elif status == 'COLOR':
+            self.report({'INFO'}, "Material color preview updated")
+        elif status == 'MISSING':
+            self.report({'WARNING'}, "Texture file could not be resolved, preview left unchanged")
+        else:
+            self.report({'INFO'}, "Material preview reset to default shader")
+
+        return {'FINISHED'}
 
 
 class A3OB_OT_paste_common_material(bpy.types.Operator):
@@ -115,9 +143,11 @@ class A3OB_PT_material(bpy.types.Panel):
         row_material = layout.row(align=True)
         row_material.operator("a3ob.paste_common_material", text="", icon='PASTEDOWN')
         row_material.prop(material_props, "material_path", text="", icon='MATERIAL')
+        layout.operator("a3ob.material_preview_update", icon='FILE_REFRESH')
 
 
 classes = (
+    A3OB_OT_material_preview_update,
     A3OB_OT_paste_common_material,
     A3OB_OT_paste_common_procedural,
     A3OB_UL_common_procedurals,
