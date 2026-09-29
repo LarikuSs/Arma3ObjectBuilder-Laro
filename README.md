@@ -1,46 +1,85 @@
-# Arma 3 Object Builder
+This repository is a fork of the original **Arma 3 Object Builder** project by [**MrClock8163**](https://github.com/MrClock8163/Arma3ObjectBuilder). It contains additional fixes and improvements focused primarily on P3D workflows, model import and export, proxy handling, material previews and validation. The original project and its history are preserved, while changes specific to this fork are maintained separately.
 
-## About the project
+## Fork Improvements
+### Improved P3D Import
+- Improved P3D handling when importing via **drag and drop**.
+- Added a `Load Textures` option when importing P3D files.
+- P3D texture references are automatically used to create Blender material previews, including texture-based and color materials.
+- Missing textures no longer interrupt the import process and are reported in the import log.
 
-**Arma 3 Object Builder** borrows its name from the infamous **Object Builder** application that's used for importing models to the P3D model format of **Arma 3**.
-While **Object Builder** bares some modelling functionality, it's by no means adequate by today's standards.
-Because of this, the need arose for an alternative, that resulted in the creation of the [**ArmAToolbox**](https://github.com/AlwarrenSidh/ArmAToolbox) add-on for **Blender** by Alwarren,
-which makes it possible to import and export animations and models to the **Arma 3** file formats directly.
+### Batch Proxy Extraction
+- `Extract Proxy` now supports extracting multiple selected proxies in a single operation.
 
-The **ArmaToolbox** has been in use by modders for many years, but since its release the code base of the add-on became cluttered with unused or broken parts (usually due to changes in the **Blender** API). This project aims to provide a new add-on, implementing a workflow that is similar to that of the **ArmaToolbox**, with improved and extended features and an interface that's more in-line with the design of **Blender**.
+### Improved P3D Export Process
+Model preparation and export validation have been improved:
+- Fire Geometry and View Geometry can now contain proxies without causing validation or export errors.
+- Unnecessary materials are removed from Geometry, View Geometry, Shadow and Memory LODs before export.
+- `Component##` selections are automatically regenerated for geometry-type LODs, including Geometry, View Geometry and Fire Geometry.
+- Existing `Occluder##` selections and proxies are not affected by `Component##` generation.
+- Export is cancelled if a required validation check fails, with the specific reason reported to the user.
 
-## Origins
+### Geometry Validation
+- Added strict Geometry validation for unused vertices and mass assigned to each physical component.
+- Missing mass or unused vertices prevent export.
 
-The project is originally a fork of Alwarren's repository, but in reality, instead of consisting of smaller changes to be merged into the main repository,
-it turned into a completely different add-on that reimplements a similar workflow with improved functionality and extended features.
+### Fire Geometry Validation
+- Added strict validation of Fire Geometry materials on every used face.
+- Every Fire Geometry material must reference a valid **penetration RVMAT** from the `P:\DZ\data\data\penetration\` directory.
+- Faces with missing or invalid penetration materials prevent export.
 
-Excerpt from the ArmAToolbox readme:
+### Roadway Validation
+- Added strict validation of Roadway sound textures: every face must have a sound texture assigned, and the referenced file must exist.
+- RVMAT files cannot be used as Roadway sound textures.
+- Missing or invalid sound textures prevent export.
 
-```txt
-Arma Toolbox for Blender
-This is a collection of Python scripts for the Blender 3D package
-that allows the user to create, import and export unbinarized
-Arma Engine .p3d files.
-```
+### Additional Improvements
+- Improved proxy handling during P3D import and export.
+- Improved validation of data before export.
+- Improved export error reporting.
 
-## Requirements and Compatibility
-
-- [**Blender** v2.90.0](https://www.blender.org/download/releases/2-90/) or higher
-- [**Arma 3 Tools**](https://store.steampowered.com/app/233800/Arma_3_Tools/) (optional for some features to work)
-
-The add-on is developed on **Blender** v2.90.0 for convenience reasons, which also has the side effect that
-it supports older versions, not just the latest releases. The add-on is tested on newer releases regardless.
-If a new release of **Blender** in the future renders it impossible to keep the add-on compatible with both old,
-and new releases, support will be dropped for legacy versions in favor of the new API.
-
-The range of **Blender** releases tested for compatibility is indicated in the changelog entry of each packed release of the add-on.
 
 ## License
+As inherited from the **ArmAToolbox**, the **Arma 3 Object Builder** add-on is released under the GNU General Public License version 3. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR  PARTICULAR PURPOSE. See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with this program. If not, see the [GNU licenses](http://www.gnu.org/licenses/). Files created using this software are not covered by this license.
 
-As inherited from the **ArmAToolbox**, the **Arma 3 Object Builder** add-on is released under the GNU General Public License version 3.
+# RU
+Этот репозиторий является форком оригинального проекта **Arma 3 Object Builder** от [**MrClock8163**](https://github.com/MrClock8163/Arma3ObjectBuilder). Форк содержит дополнительные исправления и улучшения, направленные в первую очередь на работу с P3D, импорт и экспорт моделей, обработку proxy, предпросмотр материалов и валидацию данных. Оригинальный проект и его история сохраняются, а изменения, относящиеся к этому форку, поддерживаются отдельно.
 
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR  PARTICULAR PURPOSE. See the GNU General Public License for more details.
+## Изменения в этом форке
+### Улучшен импорт P3D
+- Исправлена обработка P3D при импорте через **drag and drop**.
+- Добавлена опция `Load Textures` при импорте P3D.
+- Референсные текстуры P3D автоматически используются для создания предпросмотра материалов Blender, включая текстурные и цветовые материалы.
+- Отсутствующие текстуры не прерывают импорт и отображаются в логе импорта.
 
-You should have received a copy of the GNU General Public License along with this program. If not, see the [GNU licenses](http://www.gnu.org/licenses/).
+### Извлечение нескольких Proxy
+- `Extract Proxy` теперь позволяет извлекать несколько выделенных proxy одновременно.
 
-Files created using this software are not covered by this license.
+### Улучшен процесс экспорта P3D
+Улучшены подготовка моделей и система валидации перед экспортом:
+- Fire Geometry и View Geometry теперь могут содержать proxy без ошибок валидации и экспорта.
+- Перед экспортом удаляются ненужные материалы из Geometry, View Geometry, Shadow и Memory LOD.
+- При экспорте автоматически пересоздаются `Component##` для geometry-type LOD, включая Geometry, View Geometry и Fire Geometry.
+- При генерации `Component##` существующие `Occluder##` и proxy не затрагиваются.
+- При провале обязательных проверок экспорт прекращается, а пользователю отображается конкретная причина ошибки.
+
+### Валидация Geometry
+- Добавлена строгая проверка Geometry на наличие неиспользуемых вершин и массы у каждого физического компонента.
+- Отсутствующая масса или наличие неиспользуемых вершин блокируют экспорт.
+
+### Валидация Fire Geometry
+- Добавлена строгая проверка материалов Fire Geometry у каждой используемой грани.
+- Каждый используемый материал Fire Geometry должен ссылаться на корректный **penetration RVMAT** из директории `P:\DZ\data\data\penetration\`.
+- Грани с отсутствующим или некорректным penetration material блокируют экспорт.
+
+### Валидация Roadway
+- Добавлена строгая проверка sound texture у граней Roadway: у каждой грани должна быть указана sound texture, а сам файл должен существовать.
+- RVMAT нельзя использовать в качестве sound texture для Roadway.
+- Отсутствующая или некорректная sound texture блокирует экспорт.
+
+### Дополнительные улучшения
+- Улучшена обработка proxy при импорте и экспорте P3D.
+- Улучшена валидация данных перед экспортом.
+- Улучшены сообщения об ошибках при экспорте.
+
+## Лицензия
+Как и унаследованный от ArmAToolbox проект, Arma 3 Object Builder распространяется под лицензией GNU General Public License версии 3 (GPLv3). Программа распространяется в надежде, что она будет полезна, но БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, включая, помимо прочего, гарантии товарной пригодности или пригодности для определённой цели. Подробности см. в тексте GNU General Public License. Копия GNU General Public License должна поставляться вместе с программой. Если её нет, см.  [GNU licenses](http://www.gnu.org/licenses/). Файлы, созданные с помощью этого программного обеспечения, не подпадают под действие этой лицензии.
