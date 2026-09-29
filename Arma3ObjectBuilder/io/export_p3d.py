@@ -430,7 +430,11 @@ def get_lod_data(operator, context, validator, temp_collection):
         # validation would otherwise get confused by the proxy triangles (eg.: it'd be impossible to validate
         # that a mesh is otherwise contiguous or not).
         merge_sub_objects(operator, main_obj, sub_objects)
-        is_valid = validate_proxies(operator, proxy_objects)
+        validation_errors = []
+        proxies_valid = validate_proxies(operator, proxy_objects)
+        if not proxies_valid:
+            validation_errors.append("One or more proxy objects failed validation")
+        is_valid = proxies_valid
 
         # Prepare the actual export LOD before validation. Component## selections are
         # rebuilt from topology, so stale manually-created Component groups can never
@@ -468,11 +472,13 @@ def get_lod_data(operator, context, validator, temp_collection):
                 )
             is_valid_copies.append(copy_valid)
 
-        is_valid &= validator.validate_lod(
+        main_validation_ok = validator.validate_lod(
             main_obj, main_obj.a3ob_properties_object.lod, False,
             operator.validate_lods_warning_errors and operator.validate_lods,
             operator.relative_paths
         )
+        validation_errors.extend(getattr(validator, "last_errors", []))
+        is_valid &= main_validation_ok
 
         # Validation failure is an export failure. Never silently omit a bad
         # LOD and produce a partial P3D. Surface the concrete validation
@@ -521,14 +527,14 @@ def get_lod_data(operator, context, validator, temp_collection):
             # into Component## selections. Components were generated before
             # proxy merge, so their selections already exclude proxy geometry.
             cleanup_lod_materials(main_obj_copy)
-            lod_list.append((main_obj_copy, proxy_lookup, is_valid_copy))
+            lod_list.append((main_obj_copy, proxy_lookup, is_valid_copy, []))
             
         cleanup_uvs(main_obj)
         cleanup_normals(operator, main_obj)
         # Components were generated before merge_proxy_objects(). Keep those
         # selections intact so proxy geometry remains proxy geometry.
         cleanup_lod_materials(main_obj)
-        lod_list.append((main_obj, proxy_lookup, is_valid))
+        lod_list.append((main_obj, proxy_lookup, is_valid, validation_errors))
 
     return lod_list
 
@@ -732,15 +738,26 @@ def translate_selections(p3dm):
         tagg.name = data.translations_english_czech.get(tagg.name.lower(), tagg.name)
 
 
-def process_lod(operator, obj, proxy_lookup, is_valid, processed_signatures, logger):
+def process_lod(operator, obj, proxy_lookup, is_valid, validation_errors, processed_signatures, logger):
     object_props = obj.a3ob_properties_object
     lod_name = object_props.get_name()
 
     logger.step("Type: %s" % lod_name)
 
     if not is_valid:
+        unique = []
+        for reason in validation_errors or []:
+            if reason and reason not in unique:
+                unique.append(reason)
+
+        if unique:
+            raise p3d.P3D_Error(
+                "Export failed: LOD '%s' failed validation: %s" %
+                (lod_name, "; ".join(unique))
+            )
+
         raise p3d.P3D_Error(
-            "Export failed: LOD '%s' failed validation (see validation log for details)" % lod_name
+            "Export failed: LOD '%s' failed validation" % lod_name
         )
 
     logger.start_subproc("Processing data:")
@@ -837,10 +854,10 @@ def write_file(operator, context, file, temp_collection):
 
     mlod_lods = []
     processed_signatures = set()
-    for i, (lod, proxy_lookup, is_valid) in enumerate(lod_list):
+    for i, (lod, proxy_lookup, is_valid, validation_errors) in enumerate(lod_list):
         logger.start_subproc("LOD %d: %s" % (i + 1, lod["a3ob_original_object"]))
 
-        new_lod = process_lod(operator, lod, proxy_lookup, is_valid, processed_signatures, logger)
+        new_lod = process_lod(operator, lod, proxy_lookup, is_valid, validation_errors, processed_signatures, logger)
         if new_lod:
             mlod_lods.append(new_lod)
 
