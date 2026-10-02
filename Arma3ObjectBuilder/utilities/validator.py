@@ -584,6 +584,8 @@ class ValidatorLODRoadway(ValidatorComponentLOD):
     def has_sound(self):
         result = ValidatorResult()
 
+        # Roadway materials must point to real PAA sound textures.
+        # RVMATs and other texture types are not valid here.
         textures = {}
         for i, slot in enumerate(self.obj.material_slots):
             mat = slot.material
@@ -593,32 +595,40 @@ class ValidatorLODRoadway(ValidatorComponentLOD):
 
             textures[i] = mat.a3ob_properties_material.to_p3d(False)[0]
 
-        if len(textures) == 0:
+        if not textures:
             result.set(False, "Roadway has no sound textures assigned")
             return result
 
         checked_paths = {}
         for face in self.bm.faces:
-            mat_index = face.material_index
-            texture = textures.get(mat_index, "")
+            texture = textures.get(face.material_index, "")
 
-            if texture == "":
+            if not texture:
                 result.set(False, "Roadway face %d has no sound texture assigned" % face.index)
                 break
 
             texture_path = str(texture).replace("/", "\\").strip()
             path_lower = texture_path.lower()
 
+            # Roadway must never reference an RVMAT.
             if path_lower.endswith(".rvmat"):
-                result.set(False, "Roadway sound texture must not be an RVMAT (face %d: %s)" % (face.index, texture_path))
+                result.set(False, "Roadway texture must not be an RVMAT (face %d: %s)" % (face.index, texture_path))
                 break
 
+            # Only the standard Roadway sound texture suffixes are allowed.
+            if not (path_lower.endswith("_ext.paa") or path_lower.endswith("_int.paa")):
+                result.set(False, "Roadway texture must end with _ext.paa or _int.paa (face %d: %s)" % (face.index, texture_path))
+                break
+
+            # The referenced texture must exist as a real file.
             if texture_path not in checked_paths:
                 resolved_path = utils.restore_absolute(texture_path)
-                checked_paths[texture_path] = resolved_path if resolved_path and os.path.isfile(resolved_path) else ""
+                checked_paths[texture_path] = bool(
+                    resolved_path and os.path.isfile(resolved_path)
+                )
 
-            if checked_paths[texture_path] == "":
-                result.set(False, "Roadway sound texture file does not exist (face %d: %s)" % (face.index, texture_path))
+            if not checked_paths[texture_path]:
+                result.set(False, "Roadway texture file does not exist (face %d: %s)" % (face.index, texture_path))
                 break
 
         return result
@@ -889,6 +899,73 @@ class Validator():
             lod_id = int(str(lod).split('.')[0])
         except (TypeError, ValueError):
             lod_id = None
+
+        if lod_id == LOD.ROADWAY:
+            # Hard gate for Roadway. Roadway faces must use real PAA sound
+            # textures with the standard _ext.paa / _int.paa suffixes and
+            # must not reference an RVMAT.
+            used_material_indices = {face.material_index for face in bm.faces}
+            checked_paths = {}
+            for mat_index in used_material_indices:
+                if mat_index < 0 or mat_index >= len(obj.material_slots):
+                    message = "Roadway has faces with no material assigned"
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+                    continue
+
+                mat = obj.material_slots[mat_index].material
+                if mat is None:
+                    message = "Roadway has faces with no material assigned"
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+                    continue
+
+                props = mat.a3ob_properties_material
+                texture_raw, material_raw = props.to_p3d(False)
+                texture_path = str(texture_raw or "").replace("/", "\\").strip()
+                material_path = str(material_raw or "").replace("/", "\\").strip()
+                texture_lower = texture_path.lower()
+                material_lower = material_path.lower()
+
+                if material_lower.endswith(".rvmat"):
+                    message = (
+                        "Roadway must not use an RVMAT material "
+                        "(found: %s)" % material_path
+                    )
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+
+                if not texture_path:
+                    message = "Roadway has no sound texture assigned"
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+                    continue
+
+                if not (texture_lower.endswith("_ext.paa") or texture_lower.endswith("_int.paa")):
+                    message = (
+                        "Roadway texture must end with _ext.paa or _int.paa "
+                        "(found: %s)" % texture_path
+                    )
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
+                    continue
+
+                if texture_path not in checked_paths:
+                    resolved_path = utils.restore_absolute(texture_path)
+                    checked_paths[texture_path] = bool(
+                        resolved_path and os.path.isfile(resolved_path)
+                    )
+
+                if not checked_paths[texture_path]:
+                    message = "Roadway texture file does not exist (found: %s)" % texture_path
+                    self.last_errors.append(message)
+                    self.logger.step("ERROR: %s" % message)
+                    is_valid = False
 
         if lod_id == LOD.FIRE_GEOMETRY:
             allowed_prefix = "p:\\dz\\data\\data\\penetration\\"
